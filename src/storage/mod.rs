@@ -47,6 +47,7 @@ mod read_pool;
 mod types;
 
 use self::kv::SnapContext;
+use kvproto::kvrpcpb::*;
 pub use self::{
     errors::{get_error_kind_from_header, get_tag_from_header, Error, ErrorHeaderKind, ErrorInner},
     kv::{
@@ -91,7 +92,7 @@ use std::{
     sync::{atomic, Arc},
 };
 use tikv_util::time::{Instant, ThreadReadId};
-use txn_types::{Key, KvPair, Lock, Mutation, OldValues, TimeStamp, TsSet, Value};
+use txn_types::{Key, KvPair, Lock, Mutation, OldValues, TimeStamp, TsSet, Value, WriteType};
 
 pub type Result<T> = std::result::Result<T, Error>;
 pub type Callback<T> = Box<dyn FnOnce(Result<T>) + Send>;
@@ -650,7 +651,6 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
         let priority_tag = get_priority_tag(priority);
         let resource_tag = ResourceMeteringTag::from_rpc_context(&ctx);
         let concurrency_manager = self.concurrency_manager.clone();
-
         let res = self.read_pool.spawn_handle(
             async move {
                 {
@@ -767,6 +767,129 @@ impl<E: Engine, L: LockManager> Storage<E, L> {
             thread_rng().next_u64(),
         );
 
+        async move {
+            res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
+                .await?
+        }
+    }
+
+    pub fn vertify_read_set(
+        &self,
+        mut ctx:Context,
+        start_ts:TimeStamp,
+        commit_ts:TimeStamp,
+        start_key: Option<Key>,
+        end_key: Option<Key>,
+    )->impl Future<Output=Result<bool>>{
+        const CMD: CommandKind=CommandKind::scan;
+        let priority = ctx.get_priority();
+        let priority_tag = get_priority_tag(priority);
+        let resource_tag = ResourceMeteringTag::from_rpc_context(&ctx);
+        let concurrency_manager = self.concurrency_manager.clone();
+        // Do not allow replica read for scan_lock.
+        ctx.set_replica_read(false);
+
+        let res = self.read_pool.spawn_handle(
+            async move {
+                if let Some(start_key) = &start_key {
+                    let end_key = match &end_key {
+                        Some(k) => k.as_encoded().as_slice(),
+                        None => &[],
+                    };
+                    tls_collect_qps(
+                        ctx.get_region_id(),
+                        ctx.get_peer(),
+                        start_key.as_encoded(),
+                        end_key,
+                        false,
+                    );
+                }
+
+                KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
+                SCHED_COMMANDS_PRI_COUNTER_VEC_STATIC
+                    .get(priority_tag)
+                    .inc();
+
+                let command_duration = tikv_util::time::Instant::now_coarse();
+
+                concurrency_manager.update_max_ts(commit_ts);
+                let begin_instant = Instant::now();
+                // TODO: Though it's very unlikely to find a conflicting memory lock here, it's not
+                // a good idea to return an error to the client, making the GC fail. A better
+                // approach is to wait for these locks to be unlocked.
+                concurrency_manager.read_range_check(
+                    start_key.as_ref(),
+                    end_key.as_ref(),
+                    |key, lock| {
+                        // `Lock::check_ts_conflict` can't be used here, because LockType::Lock
+                        // can't be ignored in this case.
+                        if lock.ts < commit_ts{
+                            CHECK_MEM_LOCK_DURATION_HISTOGRAM_VEC
+                                .get(CMD)
+                                .locked
+                                .observe(begin_instant.saturating_elapsed().as_secs_f64());
+                            Err(txn::Error::from_mvcc(mvcc::ErrorInner::KeyIsLocked(
+                                lock.clone().into_lock_info(key.to_raw()?),
+                            )))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )?;
+                CHECK_MEM_LOCK_DURATION_HISTOGRAM_VEC
+                    .get(CMD)
+                    .unlocked
+                    .observe(begin_instant.saturating_elapsed().as_secs_f64());
+
+                let snap_ctx = SnapContext {
+                    pb_ctx: &ctx,
+                    ..Default::default()
+                };
+
+                let snapshot =
+                    Self::with_tls_engine(|engine| Self::snapshot(engine, snap_ctx)).await?;
+                {
+                    let begin_instant = Instant::now_coarse();
+                    let mut statistics = Statistics::default();
+                    let mut reader = MvccReader::new(
+                        snapshot,
+                        Some(ScanMode::Forward),
+                        !ctx.get_not_fill_cache(),
+                    );
+                    let result = reader
+                        .scan_writes(
+                            start_key.as_ref(),
+                            end_key.as_ref(),
+                            Some(commit_ts),
+                            |_| true,
+                        usize::MAX
+                        )
+                        .map_err(txn::Error::from);
+                    statistics.add(&reader.statistics);
+                    let (kv_pairs, _) = result?;
+                    let mut flag=true;
+                    for (_,time_stamp,_) in kv_pairs {
+                        if time_stamp >=start_ts && time_stamp<=commit_ts{
+                            flag=false;
+                            break;
+                        }
+                    }
+                    metrics::tls_collect_scan_details(CMD, &statistics);
+                    metrics::tls_collect_read_flow(ctx.get_region_id(), &statistics);
+                    SCHED_PROCESSING_READ_HISTOGRAM_STATIC
+                        .get(CMD)
+                        .observe(begin_instant.saturating_elapsed_secs());
+                    SCHED_HISTOGRAM_VEC_STATIC
+                        .get(CMD)
+                        .observe(command_duration.saturating_elapsed_secs());
+
+                    Ok(flag)
+                }
+            }
+            .in_resource_metering_tag(resource_tag),
+            priority,
+            thread_rng().next_u64(),
+        );
         async move {
             res.map_err(|_| Error::from(ErrorInner::SchedTooBusy))
                 .await?

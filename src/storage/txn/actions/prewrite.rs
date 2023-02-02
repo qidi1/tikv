@@ -66,13 +66,11 @@ pub fn prewrite<S: Snapshot>(
     if mutation.should_not_write {
         // `checkNotExists` is equivalent to a get operation, so it should update the max_ts.
         txn.concurrency_manager.update_max_ts(txn_props.start_ts);
-        let min_commit_ts = if mutation.need_min_commit_ts() {
+        // alawys need
+        let min_commit_ts = 
+            cmp::max(txn_props.min_commit_ts, txn_props.start_ts.next());
             // Don't calculate the min_commit_ts according to the concurrency manager's max_ts
             // for a should_not_write mutation because it's not persisted and doesn't change data.
-            cmp::max(txn_props.min_commit_ts, txn_props.start_ts.next())
-        } else {
-            TimeStamp::zero()
-        };
         return Ok((min_commit_ts, OldValue::Unspecified));
     }
 
@@ -365,7 +363,7 @@ impl<'a> PrewriteMutation<'a> {
             lock.secondaries = secondary_keys.to_owned();
         }
 
-        let final_min_commit_ts = if lock.use_async_commit || try_one_pc {
+        let final_min_commit_ts =  {
             let res = async_commit_timestamps(
                 &self.key,
                 &mut lock,
@@ -381,8 +379,6 @@ impl<'a> PrewriteMutation<'a> {
                 lock.secondaries = Vec::new();
             }
             res
-        } else {
-            Ok(TimeStamp::zero())
         };
 
         if try_one_pc {

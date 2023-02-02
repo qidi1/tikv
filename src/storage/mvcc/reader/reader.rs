@@ -270,6 +270,109 @@ impl<S: EngineSnapshot> MvccReader<S> {
             }
         }
     }
+      
+    /// Scan the writes to get all the latest keys with their corresponding
+    /// PUT/DELETE write records at the given version, if the version is not
+    /// specified, it will scan the latest version for each key, if the key
+    /// does not exist or is not visible at that point, an `Option::None` will
+    /// be placed. The return type is:
+    /// * `(Vec<(key, commit_ts, Option<write>)>, has_remain)`.
+    ///   - `key` is the encoded key without commit ts.
+    ///   - `commit_ts` is the latest commit ts of the key.
+    ///   - `write` is the PUT/DELETE write record at the given version.
+    ///   - `has_remain` indicates whether there MAY be remaining writes that
+    ///     can be scanned.
+    ///
+    /// This function is mainly used by
+    /// `txn::commands::FlashbackToVersionReadPhase`
+    /// and `txn::commands::FlashbackToVersion` to achieve the MVCC
+    /// overwriting.
+    pub fn scan_writes<F>(
+        &mut self,
+        start: Option<&Key>,
+        end: Option<&Key>,
+        version: Option<TimeStamp>,
+        filter: F,
+        limit: usize,
+    ) -> Result<(Vec<(Key, TimeStamp, Option<Write>)>, bool)>
+    where
+        F: Fn(&Key) -> bool,
+    {
+        self.create_write_cursor()?;
+        let cursor = self.write_cursor.as_mut().unwrap();
+        let ok = match start {
+            Some(x) => cursor.seek(x, &mut self.statistics.write)?,
+            None => cursor.seek_to_first(&mut self.statistics.write),
+        };
+        if !ok {
+            return Ok((vec![], false));
+        }
+        // Use the latest version as the default value if the version is not given.
+        let version = version.unwrap_or_else(TimeStamp::max);
+        let mut cur_key = None;
+        let mut key_writes = Vec::with_capacity(limit);
+        let mut has_remain = false;
+        while cursor.valid()? {
+            let key = Key::from_encoded_slice(cursor.key(&mut self.statistics.write));
+            if let Some(end) = end {
+                if key >= *end {
+                    has_remain = false;
+                    break;
+                }
+            }
+            let mut commit_ts = key.decode_ts()?;
+            let user_key = key.clone().truncate_ts()?;
+            // To make sure we only check each unique key once and `filter(&key)` returns
+            // true.
+            if (cur_key.is_some() && cur_key.clone().unwrap() == user_key) || !filter(&key) {
+                cursor.next(&mut self.statistics.write);
+                continue;
+            }
+            cur_key = Some(user_key.clone());
+
+            let mut write = None;
+            let version_key = user_key.clone().append_ts(version);
+            // Try to seek to the key with the specified version.
+            if cursor.near_seek(&version_key, &mut self.statistics.write)?
+                && Key::is_user_key_eq(
+                    cursor.key(&mut self.statistics.write),
+                    user_key.as_encoded(),
+                )
+            {
+                while cursor.valid()? {
+                    write =
+                        Some(WriteRef::parse(cursor.value(&mut self.statistics.write))?.to_owned());
+                    commit_ts = Key::from_encoded_slice(cursor.key(&mut self.statistics.write)).decode_ts()?;
+                    // Move to the next key.
+                    cursor.next(&mut self.statistics.write);
+                    match write.as_ref().unwrap().write_type {
+                        WriteType::Put | WriteType::Delete => {
+                            commit_ts = Key::from_encoded_slice(cursor.key(&mut self.statistics.write)).decode_ts()?;
+                            break;
+                        }
+                        WriteType::Lock | WriteType::Rollback => {
+                            // We should find the latest visible version after it.
+                            let key =
+                                Key::from_encoded_slice(cursor.key(&mut self.statistics.write));
+                            // Could not find the visible version, current cursor is on the next
+                            // key, so we set both `write` and `cur_key` to `None`.
+                            if key.truncate_ts()? != user_key {
+                                cur_key = None;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            key_writes.push((user_key, commit_ts, write));
+            if limit > 0 && key_writes.len() == limit {
+                has_remain = true;
+                break;
+            }
+        }
+        self.statistics.write.processed_keys += key_writes.len();
+        Ok((key_writes, has_remain))
+    }
 
     fn get_txn_commit_record(&mut self, key: &Key, start_ts: TimeStamp) -> Result<TxnCommitRecord> {
         // It's possible a txn with a small `start_ts` has a greater `commit_ts` than a txn with

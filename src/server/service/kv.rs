@@ -1200,6 +1200,7 @@ fn handle_batch_commands_request<E: Engine, L: LockManager>(
         RawCoprocessor, future_raw_coprocessor(copr_v2, storage), coprocessor;
         PessimisticLock, future_acquire_pessimistic_lock(storage), kv_pessimistic_lock;
         PessimisticRollback, future_pessimistic_rollback(storage), kv_pessimistic_rollback;
+        VertifyReadSet, future_vertify_read_set(storage),kv_pessimistic_rollback;
         Empty, future_handle_empty(), invalid;
     }
 }
@@ -1220,6 +1221,32 @@ async fn future_handle_empty(
             .await;
     }
     Ok(res)
+}
+
+fn future_vertify_read_set<E: Engine, L: LockManager>(
+    storage: &Storage<E, L>,
+    mut req: VertifyReadSetRequest,
+) -> impl Future<Output = ServerResult<VertifyReadSetResponse>> {
+
+    let end_key = Key::from_raw_maybe_unbounded(req.get_end_key());
+    let start_key= Key::from_raw_maybe_unbounded(req.get_start_key());
+    let v=storage.vertify_read_set(
+        req.take_context(),
+        req.get_start_version().into(), 
+        req.get_commit_version().into(), 
+        start_key, 
+        end_key);
+    async move{
+        let mut resp =VertifyReadSetResponse::default();
+        let v = v.await;
+        match v{
+            Ok(flag)=>{
+                resp.set_same_read_set(flag);
+            }
+            Err(e) => resp.set_error(extract_key_error(&e)),
+        }
+        Ok(resp)
+    }
 }
 
 fn future_get<E: Engine, L: LockManager>(
